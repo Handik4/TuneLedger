@@ -2,7 +2,7 @@
 
 import json
 
-CONTRACT_PATH = "contracts/tuneledger_royalty.py"
+CONTRACT_PATH = "packages/contracts/tuneledger_royalty.py"
 MUSIC_PROMPT_PATTERN = r".*impartial Musicologist and Copyright Audio Auditor.*"
 
 

@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.gltest_cache/
+artifacts/
+.DS_Store
