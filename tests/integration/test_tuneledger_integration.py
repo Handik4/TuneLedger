@@ -9,18 +9,21 @@ def test_tuneledger_integration_flow():
     factory = get_contract_factory("TuneLedgerRoyalty")
     contract = factory.deploy(args=[])
 
-    # 1. Register Original Master Work
+    # 1. Register Original Master Work. The fingerprint is a Keccak-256
+    #    commitment plus the URI the contract fetches the document from itself.
     tx_work = contract.register_original_work(
         args=[
             "work-int-01",
             "Analog Modular Synth Hook",
             "US-MOD-85-00101",
-            "sha256:moog-modular-sequence-120bpm",
+            "keccak256:0000000000000000000000000000000000000000000000000000000000000000",
+            "https://fingerprints.tuneledger.music/master/moog-sequence.json",
         ]
     ).transact()
     assert tx_execution_succeeded(tx_work)
 
-    # 2. Producer Requests Sample Clearance Agreement
+    # 2. Producer Requests Sample Clearance Agreement, pinning the derivative
+    #    fingerprint URI so the evidence cannot be swapped later.
     tx_aggr = contract.create_clearance_agreement(
         args=[
             "aggr-int-01",
@@ -28,6 +31,7 @@ def test_tuneledger_integration_flow():
             "Deep House Sunset Remix",
             20,
             160,
+            "https://fingerprints.tuneledger.music/derivative/deep-house-sunset.json",
         ],
         value=2 * 10**18,
     ).transact()

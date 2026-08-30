@@ -1,7 +1,7 @@
 import { createClient } from 'genlayer-js';
 import { ethers } from 'ethers';
 
-const CONTRACT_ADDRESS = '0x4F86AaCFB5823dcc0CC4bb02E77D5384081f01ac';
+const CONTRACT_ADDRESS = '0x33f31423C9C83c28026A2626525eAF1BF3909b82';
 const RPC_ENDPOINT = 'https://studio.genlayer.com/api';
 
 async function main() {

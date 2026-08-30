@@ -1,7 +1,7 @@
 .PHONY: test lint
 
 test:
-	.venv/bin/pytest packages/tests/ -v
+	.venv/bin/pytest contract/tests/ -v
 
 lint:
-	genvm-lint check packages/contracts/tuneledger_royalty.py
+	genvm-lint check contract/contracts/tuneledger_royalty.py
