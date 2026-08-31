@@ -22,8 +22,9 @@ def test_tuneledger_integration_flow():
     ).transact()
     assert tx_execution_succeeded(tx_work)
 
-    # 2. Producer Requests Sample Clearance Agreement, pinning the derivative
-    #    fingerprint URI so the evidence cannot be swapped later.
+    # 2. Producer Requests Sample Clearance Agreement. Both the URI (where to
+    #    fetch evidence) and the commitment (keccak digest of expected bytes)
+    #    are bound immutably at creation time.
     tx_aggr = contract.create_clearance_agreement(
         args=[
             "aggr-int-01",
@@ -32,6 +33,7 @@ def test_tuneledger_integration_flow():
             20,
             160,
             "https://fingerprints.tuneledger.music/derivative/deep-house-sunset.json",
+            "keccak256:0000000000000000000000000000000000000000000000000000000000000000",
         ],
         value=2 * 10**18,
     ).transact()

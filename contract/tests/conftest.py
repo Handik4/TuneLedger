@@ -142,7 +142,11 @@ def create_agreement(
     total_sec: int = 150,
     deposit_atto: int = 5 * ATTO,
     derivative_uri: str = DERIVATIVE_URI,
+    derivative_fingerprint_hash: str = None,
+    derivative_doc: str = DERIVATIVE_DOC,
 ):
+    if derivative_fingerprint_hash is None:
+        derivative_fingerprint_hash = keccak_commitment(derivative_doc)
     direct_vm.sender = producer
     direct_vm.value = deposit_atto
     contract.create_clearance_agreement(
@@ -152,6 +156,7 @@ def create_agreement(
         sample_sec,
         total_sec,
         derivative_uri,
+        derivative_fingerprint_hash,
     )
     direct_vm.value = 0
     return agreement_id

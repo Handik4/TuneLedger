@@ -130,6 +130,7 @@ def main():
             6,    # 6 seconds of sampled drum break
             180,  # 180 seconds total track length
             DERIVATIVE_URI,
+            keccak_commitment(DERIVATIVE_DOC),   # cryptographic commitment bound at creation
         )
         vm.value = 0
         agree = contract.get_agreement("agree-jungle-remix-2026")
@@ -138,6 +139,8 @@ def main():
         log_info("Derivative Title", agree["derivative_title"])
         log_info("Sample Duration / Total Track", f"{agree['sample_duration_sec']}s / {agree['total_track_sec']}s")
         log_info("Derivative Fingerprint URI", agree["derivative_fingerprint_uri"])
+        log_info("Derivative Fingerprint Commitment", agree["derivative_fingerprint_hash"][:32] + "...")
+        log_info("Expires At Protocol Seq", str(agree["expires_at_seq"]))
         log_info("Initial Status", agree["status"])
 
         # STEP 3: Multi-LLM Musicology Quorum & ISRC Registry Audit

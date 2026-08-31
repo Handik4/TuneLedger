@@ -11,6 +11,7 @@ STATUS_REQUESTED = "CLEARANCE_REQUESTED"
 STATUS_APPROVED = "APPROVED_ACTIVE"
 STATUS_REJECTED = "REJECTED"
 STATUS_DISPUTED = "DISPUTED"
+STATUS_CANCELLED = "CANCELLED"
 
 DECISION_APPROVED = "APPROVED"
 DECISION_REJECTED = "REJECTED"
@@ -20,6 +21,14 @@ MIN_CLEARANCE_FEE = 1 * ATTO     # 1 GEN minimum clearance deposit
 MAX_ROYALTY_SPLIT_BPS = 5000     # 50.00% max sample royalty split
 MIN_ROYALTY_SPLIT_BPS = 500      # 5.00% min sample royalty split
 BPS_DENOMINATOR = 10000          # 100.00% expressed in basis points
+
+# Minimum bond required to open a dispute. Forfeited to the master owner if
+# the dispute is dismissed; returned to the disputant if upheld.
+MIN_DISPUTE_BOND_ATTO = 1 * ATTO
+
+# Default number of agreement-creation events that must occur before a
+# CLEARANCE_REQUESTED agreement can be cancelled. Configurable at deployment.
+DEFAULT_CLEARANCE_EXPIRY_WINDOW = 50
 
 # A similarity below this floor is not a derivative work at all, so it never
 # clears regardless of how much of the track the producer claims to have used.
@@ -95,11 +104,22 @@ class ClearanceAgreement:
     # Where the derivative's acoustic fingerprint document lives. Pinned at
     # agreement creation so the producer cannot swap the evidence afterwards.
     derivative_fingerprint_uri: str
+    # Keccak-256 commitment to the derivative acoustic fingerprint document.
+    # Bound immutably at agreement creation; the evaluation re-derives this
+    # from the bytes it fetches itself and rejects any mismatch.
+    derivative_fingerprint_hash: str
     clearance_deposit_atto: u256
     status: str
     royalty_split_bps: u256
     total_royalties_distributed_atto: u256
     registered_seq: u256
+    # Expiry: the agreement can be cancelled once total_agreements_created
+    # reaches this value, recovering the locked deposit for the producer.
+    expires_at_seq: u256
+    # Dispute fields — populated when a dispute is opened.
+    dispute_reason: str
+    dispute_bond_atto: u256
+    disputant_hex: str
 
 
 @allow_storage
@@ -109,12 +129,17 @@ class RoyaltyAuditRecord:
     decision: str
     similarity_score: u256
     royalty_split_bps: u256
-    # True only when the fetched master evidence matched the on-chain commitment.
+    # True only when BOTH the master and derivative evidence matched their
+    # respective on-chain commitments (enclave attestation binding).
     fingerprint_verified: bool
     master_evidence_digest: str
     derivative_evidence_digest: str
     rationale: str
     registry_feed_summary: str
+    # The model / computation enclave commitment that produced this audit.
+    # Binds the compute commitment to the settlement so the result can be
+    # traced back to a specific model version.
+    model_commitment: str
     timestamp_seq: u256
 
 
@@ -133,6 +158,12 @@ class _Recipient:
 class TuneLedgerRoyalty(gl.Contract):
     owner: Address
     musicology_oracle_base: str
+    # Commitment to the AI model / enclave that evaluates clearances. Bound at
+    # deployment so every audit record is traceable to a specific computation.
+    model_commitment: str
+    # Number of agreement-creation events before an unevaluated agreement may
+    # be cancelled by its producer. Configurable at deployment for testability.
+    clearance_expiry_window: u256
 
     total_works_registered: u256
     total_agreements_created: u256
@@ -149,9 +180,16 @@ class TuneLedgerRoyalty(gl.Contract):
     # Global Audit Records
     records: DynArray[RoyaltyAuditRecord]
 
-    def __init__(self, musicology_oracle_base: str = "https://api.tuneledger.music/v1/acoustid-isrc"):
+    def __init__(
+        self,
+        musicology_oracle_base: str = "https://api.tuneledger.music/v1/acoustid-isrc",
+        model_commitment: str = "genlayer-musicology-v1",
+        clearance_expiry_window: u256 = u256(DEFAULT_CLEARANCE_EXPIRY_WINDOW),
+    ):
         self.owner = gl.message.sender_address
         self.musicology_oracle_base = musicology_oracle_base
+        self.model_commitment = model_commitment
+        self.clearance_expiry_window = clearance_expiry_window
         self.total_works_registered = u256(0)
         self.total_agreements_created = u256(0)
         self.total_royalties_split_atto = u256(0)
@@ -205,6 +243,7 @@ class TuneLedgerRoyalty(gl.Contract):
         sample_duration_sec: u256,
         total_track_sec: u256,
         derivative_fingerprint_uri: str,
+        derivative_fingerprint_hash: str,
     ) -> None:
         if not agreement_id or len(agreement_id.strip()) == 0:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} Agreement ID cannot be empty")
@@ -222,11 +261,21 @@ class TuneLedgerRoyalty(gl.Contract):
 
         _require_fetchable_uri(derivative_fingerprint_uri, "Derivative fingerprint URI")
 
+        if not derivative_fingerprint_hash or len(derivative_fingerprint_hash.strip()) == 0:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Derivative fingerprint commitment cannot be empty")
+
         deposit = int(gl.message.value)
         if deposit < int(MIN_CLEARANCE_FEE):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} Minimum clearance deposit is 1 GEN")
 
+        # total_agreements_created has not been incremented yet for this call,
+        # so the effective current count after this agreement is registered is
+        # total_agreements_created + 1. Expiry fires once that count grows by
+        # clearance_expiry_window more, giving a forward-looking logical clock.
         seq = u256(len(self.agreement_ids) + 1)
+        expires_at = u256(
+            int(self.total_agreements_created) + 1 + int(self.clearance_expiry_window)
+        )
         aggr = ClearanceAgreement(
             agreement_id=agreement_id,
             original_work_id=original_work_id,
@@ -235,11 +284,16 @@ class TuneLedgerRoyalty(gl.Contract):
             sample_duration_sec=sample_duration_sec,
             total_track_sec=total_track_sec,
             derivative_fingerprint_uri=derivative_fingerprint_uri.strip(),
+            derivative_fingerprint_hash=derivative_fingerprint_hash.strip(),
             clearance_deposit_atto=u256(deposit),
             status=STATUS_REQUESTED,
             royalty_split_bps=u256(0),
             total_royalties_distributed_atto=u256(0),
             registered_seq=seq,
+            expires_at_seq=expires_at,
+            dispute_reason="",
+            dispute_bond_atto=u256(0),
+            disputant_hex="",
         )
 
         self.agreements[agreement_id] = aggr
@@ -278,7 +332,8 @@ class TuneLedgerRoyalty(gl.Contract):
             sample_weight=sample_weight,
             master_uri=work.fingerprint_uri,
             derivative_uri=aggr.derivative_fingerprint_uri,
-            expected_fingerprint=work.audio_fingerprint_hash,
+            expected_master_fingerprint=work.audio_fingerprint_hash,
+            expected_derivative_fingerprint=aggr.derivative_fingerprint_hash,
             registry_url=registry_url,
         )
 
@@ -324,6 +379,7 @@ class TuneLedgerRoyalty(gl.Contract):
             derivative_evidence_digest=derivative_digest,
             rationale=rationale,
             registry_feed_summary=registry_feed,
+            model_commitment=self.model_commitment,
             timestamp_seq=u256(len(self.records) + 1),
         )
         self.records.append(rec)
@@ -335,7 +391,8 @@ class TuneLedgerRoyalty(gl.Contract):
         sample_weight: int,
         master_uri: str,
         derivative_uri: str,
-        expected_fingerprint: str,
+        expected_master_fingerprint: str,
+        expected_derivative_fingerprint: str,
         registry_url: str,
     ) -> dict:
         def leader_fn() -> dict:
@@ -349,9 +406,14 @@ class TuneLedgerRoyalty(gl.Contract):
             master_digest = _keccak_hex(master_bytes)
             derivative_digest = _keccak_hex(derivative_bytes)
 
-            # Cryptographically bind the fetched master evidence to the
-            # commitment the rights holder registered on-chain.
-            fingerprint_verified = _digest_matches(master_digest, expected_fingerprint)
+            # Both evidence documents must match their on-chain commitments.
+            # The master commitment was bound at original work registration;
+            # the derivative commitment was bound at agreement creation. A
+            # mismatch on either means the evidence was replaced after the
+            # commitment was made, so the clearance cannot proceed.
+            master_verified = _digest_matches(master_digest, expected_master_fingerprint)
+            derivative_verified = _digest_matches(derivative_digest, expected_derivative_fingerprint)
+            fingerprint_verified = master_verified and derivative_verified
 
             registry_summary = _fetch_registry_summary(registry_url)
 
@@ -468,21 +530,134 @@ class TuneLedgerRoyalty(gl.Contract):
             _Recipient(aggr.derivative_producer).emit_transfer(value=u256(derivative_share), on="finalized")
 
     # ------------------------------------------------------------------
-    # 5. Sample Dispute
+    # 5. Cancellation, Dispute & Resolution
     # ------------------------------------------------------------------
     @gl.public.write
-    def dispute_sample(self, agreement_id: str, dispute_reason: str) -> None:
+    def cancel_agreement(self, agreement_id: str) -> None:
+        """Cancel an expired CLEARANCE_REQUESTED agreement and reclaim the deposit.
+
+        The expiry clock is total_agreements_created: once that counter reaches
+        expires_at_seq the producer (or master owner, or contract owner) may call
+        this to recover the locked clearance deposit. This prevents the protocol
+        from holding funds indefinitely when an evaluation never arrives.
+        """
         if agreement_id not in self.agreements:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} Agreement {agreement_id} not found")
 
         aggr = self.agreements[agreement_id]
+        if aggr.status != STATUS_REQUESTED:
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Only CLEARANCE_REQUESTED agreements can be cancelled; "
+                f"current status: {aggr.status}"
+            )
+
+        if int(self.total_agreements_created) < int(aggr.expires_at_seq):
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Agreement has not expired yet; "
+                f"expires at protocol count {int(aggr.expires_at_seq)}, "
+                f"current count is {int(self.total_agreements_created)}"
+            )
+
+        sender = gl.message.sender_address
+        work = self.works[aggr.original_work_id]
+        if sender != aggr.derivative_producer and sender != work.master_owner and sender != self.owner:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Only producer, master owner, or contract owner can cancel")
+
+        aggr.status = STATUS_CANCELLED
+        self.agreements[agreement_id] = aggr
+
+        dep = int(aggr.clearance_deposit_atto)
+        if dep > 0:
+            _Recipient(aggr.derivative_producer).emit_transfer(value=u256(dep), on="finalized")
+
+    @gl.public.write.payable
+    def dispute_sample(self, agreement_id: str, dispute_reason: str) -> None:
+        """Open a dispute on an APPROVED_ACTIVE agreement.
+
+        The caller must attach a bond of at least MIN_DISPUTE_BOND_ATTO. The
+        bond is held until resolve_dispute is called:
+          - DISMISSED (dispute invalid): bond forwarded to the master rights holder.
+          - UPHELD (dispute valid):      bond returned to the disputant.
+
+        The dispute reason and bond are stored on-chain so the resolution record
+        is self-contained.
+        """
+        if agreement_id not in self.agreements:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Agreement {agreement_id} not found")
+
+        aggr = self.agreements[agreement_id]
+        if aggr.status != STATUS_APPROVED:
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Only APPROVED_ACTIVE agreements can be disputed; "
+                f"current status: {aggr.status}"
+            )
+
+        bond = int(gl.message.value)
+        if bond < int(MIN_DISPUTE_BOND_ATTO):
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Dispute requires a bond of at least 1 GEN")
+
         work = self.works[aggr.original_work_id]
         sender = gl.message.sender_address
         if sender != work.master_owner and sender != aggr.derivative_producer and sender != self.owner:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} Only master owner or producer can dispute")
 
         aggr.status = STATUS_DISPUTED
+        aggr.dispute_reason = dispute_reason
+        aggr.dispute_bond_atto = u256(bond)
+        aggr.disputant_hex = sender.as_hex
         self.agreements[agreement_id] = aggr
+
+    @gl.public.write
+    def resolve_dispute(self, agreement_id: str, resolution: str) -> None:
+        """Resolve a DISPUTED agreement; callable only by the contract owner.
+
+        resolution must be "UPHELD" (dispute valid → agreement REJECTED, bond
+        returned to disputant) or "DISMISSED" (dispute invalid → agreement
+        reinstated APPROVED_ACTIVE, bond forwarded to master rights holder).
+        """
+        if agreement_id not in self.agreements:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Agreement {agreement_id} not found")
+
+        if gl.message.sender_address != self.owner:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Only contract owner can resolve disputes")
+
+        aggr = self.agreements[agreement_id]
+        if aggr.status != STATUS_DISPUTED:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Agreement is not in DISPUTED status")
+
+        work = self.works[aggr.original_work_id]
+        resolution_upper = resolution.strip().upper()
+        bond = int(aggr.dispute_bond_atto)
+
+        if resolution_upper == "UPHELD":
+            # Dispute is valid: agreement is rejected, bond returned to disputant.
+            aggr.status = STATUS_REJECTED
+            if bond > 0 and aggr.disputant_hex:
+                _Recipient(Address(aggr.disputant_hex)).emit_transfer(
+                    value=u256(bond), on="finalized"
+                )
+        elif resolution_upper == "DISMISSED":
+            # Dispute is invalid: agreement reinstated, bond forfeited to master owner.
+            aggr.status = STATUS_APPROVED
+            if bond > 0:
+                _Recipient(work.master_owner).emit_transfer(value=u256(bond), on="finalized")
+        else:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Resolution must be UPHELD or DISMISSED")
+
+        self.agreements[agreement_id] = aggr
+
+    @gl.public.view
+    def get_dispute_info(self, agreement_id: str) -> dict:
+        """Return the stored dispute evidence and bond for an agreement."""
+        if agreement_id not in self.agreements:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Agreement {agreement_id} not found")
+        aggr = self.agreements[agreement_id]
+        return {
+            "status": aggr.status,
+            "dispute_reason": aggr.dispute_reason,
+            "dispute_bond_atto": str(int(aggr.dispute_bond_atto)),
+            "disputant_hex": aggr.disputant_hex,
+        }
 
     # ------------------------------------------------------------------
     # 6. View Methods & Protocol Overview
@@ -515,11 +690,13 @@ class TuneLedgerRoyalty(gl.Contract):
             "sample_duration_sec": int(aggr.sample_duration_sec),
             "total_track_sec": int(aggr.total_track_sec),
             "derivative_fingerprint_uri": aggr.derivative_fingerprint_uri,
+            "derivative_fingerprint_hash": aggr.derivative_fingerprint_hash,
             "clearance_deposit_atto": str(int(aggr.clearance_deposit_atto)),
             "status": aggr.status,
             "royalty_split_bps": int(aggr.royalty_split_bps),
             "total_royalties_distributed_atto": str(int(aggr.total_royalties_distributed_atto)),
             "registered_seq": int(aggr.registered_seq),
+            "expires_at_seq": int(aggr.expires_at_seq),
         }
 
     @gl.public.view
@@ -536,6 +713,7 @@ class TuneLedgerRoyalty(gl.Contract):
                     "derivative_evidence_digest": r.derivative_evidence_digest,
                     "rationale": r.rationale,
                     "registry_feed_summary": r.registry_feed_summary,
+                    "model_commitment": r.model_commitment,
                     "timestamp_seq": int(r.timestamp_seq),
                 })
         return out
@@ -606,7 +784,10 @@ class TuneLedgerRoyalty(gl.Contract):
         return {
             "owner": self.owner.as_hex,
             "musicology_oracle_base": self.musicology_oracle_base,
+            "model_commitment": self.model_commitment,
+            "clearance_expiry_window": int(self.clearance_expiry_window),
             "min_clearance_similarity": MIN_CLEARANCE_SIMILARITY,
+            "min_dispute_bond_atto": str(MIN_DISPUTE_BOND_ATTO),
             "total_works_registered": int(self.total_works_registered),
             "total_agreements_created": int(self.total_agreements_created),
             "total_royalties_split_atto": str(int(self.total_royalties_split_atto)),
