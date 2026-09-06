@@ -67,9 +67,10 @@ and 85 disagree (2800 vs 4000 bps) and are rejected.
 ```yaml
 Protocol Name: TuneLedger Music Royalty Engine
 Chain Architecture: GenLayer StudioNet (Chain ID: 61999)
-Contract Address: "0x33f31423C9C83c28026A2626525eAF1BF3909b82"
-Deployer Account: "0x7e1437789960927eBa45A2E6237BDDdB8c422600"
-Deployment Tx: "0x1ce7e8c4c0f6e6b899ad0705e744a61a04c4ab7d337b8af37665e9ac0902069a"
+Contract Address: "0x9452A910C3bB23f18A4d655de7133E98eD0fDbc2"
+Deployer Account: "0x5A9cA319a6566CD5a4476f1e9b77fB3fE4daC66D"
+Deployment Tx: "0x2b689de0fb07b46c442999916b3a6e6564c9ae2936fc5e43162e622d8d277ff5"
+Explorer: "https://explorer-studio.genlayer.com/address/0x9452A910C3bB23f18A4d655de7133E98eD0fDbc2"
 Status: ACTIVE_DEPLOYED
 ```
 
