@@ -322,7 +322,12 @@ def test_audit_record_captures_fetched_evidence_digests(direct_vm, direct_deploy
 
 
 def test_unreachable_master_evidence_aborts_clearance(direct_vm, direct_deploy, direct_alice, direct_bob):
-    """Fingerprint evidence is mandatory; a dead host stops the clearance."""
+    """A TRANSIENT master fault (5xx) is retryable — it aborts, it does not settle.
+
+    A 503 is transient, so the clearance must NOT be settled/refunded on a
+    momentary outage (that would let a temporary blip permanently reject a valid
+    clearance). It raises a [TRANSIENT] error so the transaction can be retried.
+    """
     contract = direct_deploy(CONTRACT_PATH)
     register_work(contract, direct_vm, direct_alice, work_id="work-down")
     create_agreement(contract, direct_vm, direct_bob, agreement_id="aggr-down", work_id="work-down")
@@ -334,6 +339,70 @@ def test_unreachable_master_evidence_aborts_clearance(direct_vm, direct_deploy, 
     with pytest.raises(Exception) as exc:
         contract.evaluate_sample_clearance("aggr-down")
     assert "master fingerprint host returned HTTP 503" in str(exc.value)
+
+
+def test_master_uri_permanent_failure_refunds_without_slashing(direct_vm, direct_deploy, direct_alice, direct_bob):
+    """A PERMANENT master-side URI failure (4xx) refunds the producer, no slash.
+
+    Separate master/derivative verification: the master fingerprint is the master
+    owner's responsibility. If its URI permanently fails to resolve (here HTTP
+    404), the clearance aborts cleanly and the producer's deposit is refunded —
+    recorded as MASTER_UNVERIFIED, never MALICIOUS_REPORT.
+    """
+    contract = direct_deploy(CONTRACT_PATH)
+    register_work(contract, direct_vm, direct_alice, work_id="work-master-404")
+    create_agreement(
+        contract, direct_vm, direct_bob,
+        agreement_id="aggr-master-404", work_id="work-master-404", deposit_atto=4 * ATTO,
+    )
+
+    # Master host permanently unreachable (404); derivative + registry are fine.
+    mock_fingerprint_evidence(direct_vm, master_status=404)
+    mock_music_registry_oracle(direct_vm)
+    mock_ai_musicology(direct_vm, decision="APPROVED", similarity_score=99)
+
+    contract.evaluate_sample_clearance("aggr-master-404")
+
+    aggr = contract.get_agreement("aggr-master-404")
+    assert aggr["status"] == "REJECTED"
+    assert aggr["royalty_split_bps"] == 0
+
+    record = contract.get_records("aggr-master-404")[0]
+    assert record["fingerprint_verified"] is False
+    assert record["decision"] == "MASTER_UNVERIFIED", (
+        "A permanent master-side URI failure must refund (MASTER_UNVERIFIED), not slash"
+    )
+    assert record["decision"] != "MALICIOUS_REPORT"
+
+
+def test_master_commitment_mismatch_refunds_without_slashing(direct_vm, direct_deploy, direct_alice, direct_bob):
+    """A master commitment mismatch refunds the producer without slashing.
+
+    The master document served does not match the keccak commitment bound at work
+    registration. That is a master-side integrity failure, so the producer's
+    deposit is refunded (MASTER_UNVERIFIED) rather than slashed.
+    """
+    contract = direct_deploy(CONTRACT_PATH)
+    register_work(contract, direct_vm, direct_alice, work_id="work-master-mismatch")
+    create_agreement(
+        contract, direct_vm, direct_bob,
+        agreement_id="aggr-master-mismatch", work_id="work-master-mismatch", deposit_atto=4 * ATTO,
+    )
+
+    # Serve a different master document than the one committed on-chain.
+    mock_fingerprint_evidence(direct_vm, master_doc='{"format": "chromaprint", "vector": [5, 5, 5]}')
+    mock_music_registry_oracle(direct_vm)
+    mock_ai_musicology(direct_vm, decision="APPROVED", similarity_score=99)
+
+    contract.evaluate_sample_clearance("aggr-master-mismatch")
+
+    aggr = contract.get_agreement("aggr-master-mismatch")
+    assert aggr["status"] == "REJECTED"
+    assert aggr["royalty_split_bps"] == 0
+
+    record = contract.get_records("aggr-master-mismatch")[0]
+    assert record["fingerprint_verified"] is False
+    assert record["decision"] == "MASTER_UNVERIFIED"
 
 
 def test_evaluate_twice_rejection(direct_vm, direct_deploy, direct_alice, direct_bob):
@@ -708,6 +777,113 @@ def test_cancel_unauthorized_rejected(direct_vm, direct_deploy, direct_alice, di
     with pytest.raises(Exception) as exc:
         contract.cancel_agreement("aggr-cancel-auth")
     assert "producer, master owner, or contract owner" in str(exc.value)
+
+
+# -----------------------------------------------------------------------------
+# 7b. Bounded Cancellation — claim_expired_deposit (producer self-service)
+# -----------------------------------------------------------------------------
+def test_claim_expired_deposit_after_timeout_refunds_producer(
+    direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie
+):
+    """After the deadline, the producer can reclaim 100% of an unevaluated deposit.
+
+    The claim requires no counterparty action and no new agreement — the producer
+    calls claim_expired_deposit on their own once the bounded deadline elapses.
+    """
+    direct_vm.sender = direct_alice
+    contract = direct_deploy(
+        CONTRACT_PATH,
+        "https://api.tuneledger.music/v1/acoustid-isrc",
+        "genlayer-musicology-v1",
+        2,  # tiny expiry window
+    )
+    register_work(contract, direct_vm, direct_alice, work_id="work-claim-ok")
+    # Agreement 1: expires_at_seq = 0 + 1 + 2 = 3.
+    create_agreement(
+        contract, direct_vm, direct_bob,
+        agreement_id="aggr-claim-ok", work_id="work-claim-ok", deposit_atto=3 * ATTO,
+    )
+    # Push total_agreements_created past the deadline.
+    register_work(contract, direct_vm, direct_alice, work_id="work-claim-filler", title="Filler")
+    for i in range(3):
+        create_agreement(
+            contract, direct_vm, direct_charlie,
+            agreement_id=f"aggr-claim-filler-{i}", work_id="work-claim-filler",
+        )
+
+    assert contract.get_agreement("aggr-claim-ok")["status"] == "CLEARANCE_REQUESTED"
+
+    # Producer reclaims on their own — no counterparty involvement.
+    direct_vm.sender = direct_bob
+    contract.claim_expired_deposit("aggr-claim-ok")
+
+    assert contract.get_agreement("aggr-claim-ok")["status"] == "CANCELLED"
+
+
+def test_claim_expired_deposit_before_timeout_strictly_rejected(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """A claim before the bounded deadline must be strictly rejected."""
+    direct_vm.sender = direct_alice
+    contract = direct_deploy(
+        CONTRACT_PATH,
+        "https://api.tuneledger.music/v1/acoustid-isrc",
+        "genlayer-musicology-v1",
+        5,  # deadline requires 6 agreements; only 1 exists
+    )
+    register_work(contract, direct_vm, direct_alice, work_id="work-claim-early")
+    create_agreement(
+        contract, direct_vm, direct_bob,
+        agreement_id="aggr-claim-early", work_id="work-claim-early", deposit_atto=3 * ATTO,
+    )
+
+    direct_vm.sender = direct_bob
+    with pytest.raises(Exception) as exc:
+        contract.claim_expired_deposit("aggr-claim-early")
+    assert "not yet claimable" in str(exc.value)
+
+    # The agreement is untouched and still awaiting evaluation.
+    assert contract.get_agreement("aggr-claim-early")["status"] == "CLEARANCE_REQUESTED"
+
+
+def test_claim_expired_deposit_only_producer(
+    direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie
+):
+    """Only the funding producer may claim the expired deposit — not the owner or a third party."""
+    direct_vm.sender = direct_alice
+    contract = direct_deploy(
+        CONTRACT_PATH,
+        "https://api.tuneledger.music/v1/acoustid-isrc",
+        "genlayer-musicology-v1",
+        0,  # already claimable
+    )
+    register_work(contract, direct_vm, direct_alice, work_id="work-claim-auth")
+    create_agreement(
+        contract, direct_vm, direct_bob,
+        agreement_id="aggr-claim-auth", work_id="work-claim-auth", deposit_atto=2 * ATTO,
+    )
+
+    # A third party (charlie) cannot claim the producer's deposit.
+    direct_vm.sender = direct_charlie
+    with pytest.raises(Exception) as exc:
+        contract.claim_expired_deposit("aggr-claim-auth")
+    assert "Only the derivative producer" in str(exc.value)
+
+
+def test_claim_expired_deposit_non_requested_rejected(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """An already-evaluated agreement cannot be claimed via claim_expired_deposit."""
+    contract = direct_deploy(CONTRACT_PATH)
+    register_work(contract, direct_vm, direct_alice, work_id="work-claim-eval")
+    create_agreement(contract, direct_vm, direct_bob, agreement_id="aggr-claim-eval", work_id="work-claim-eval")
+    mock_full_audit(direct_vm, decision="APPROVED", similarity_score=80)
+    contract.evaluate_sample_clearance("aggr-claim-eval")
+
+    direct_vm.sender = direct_bob
+    with pytest.raises(Exception) as exc:
+        contract.claim_expired_deposit("aggr-claim-eval")
+    assert "CLEARANCE_REQUESTED" in str(exc.value)
 
 
 # -----------------------------------------------------------------------------

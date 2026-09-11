@@ -1,0 +1,32 @@
+{
+  "network": "studio-dev",
+  "networkName": "GenLayer Studio Devnet",
+  "chainId": 61997,
+  "rpc": "https://studio-dev.genlayer.com/api",
+  "contract": "TuneLedgerRoyalty",
+  "contractPath": "contract/contracts/tuneledger_royalty.py",
+  "runnerVersion": "v0.3.0",
+  "runner": "py-genlayer:5jycge4q8k23462jtb0b9fyey1s9qz928sz2nbrd9mg4sxqg2qng",
+  "contractAddress": "0x211488f2d01bA2B48B81377290691B8687C5b899",
+  "deployTxHash": "0xbdfb4b22794481ff22ce2bef7425eb9ecb762d7127105ffef9ab2b94b54fc94d",
+  "deployer": "0x2e56c8579fa11cb144e6fd778da772061f4dd930",
+  "consensusStatus": "ACCEPTED",
+  "explorerUrl": "https://explorer-studio-dev.genlayer.com/address/0x211488f2d01bA2B48B81377290691B8687C5b899",
+  "constructorArgs": {
+    "musicology_oracle_base": "https://api.tuneledger.music/v1/acoustid-isrc",
+    "model_commitment": "genlayer-musicology-v1",
+    "clearance_expiry_window": 50
+  },
+  "verifiedOnChain": {
+    "get_protocol_overview": {
+      "owner": "0x2E56C8579fA11CB144E6FD778dA772061f4dd930",
+      "clearance_expiry_window": 50,
+      "min_clearance_similarity": 40,
+      "min_dispute_bond_atto": "1000000000000000000",
+      "model_commitment": "genlayer-musicology-v1",
+      "total_works_registered": 0,
+      "total_agreements_created": 0,
+      "total_royalties_split_atto": "0"
+    }
+  }
+}

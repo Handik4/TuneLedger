@@ -1,8 +1,18 @@
-# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+# v0.3.0
+# { "Depends": "py-genlayer:5jycge4q8k23462jtb0b9fyey1s9qz928sz2nbrd9mg4sxqg2qng" }
 
 import json
 from dataclasses import dataclass
-from genlayer import *
+
+# v0.3.0 import idiom: the runner exposes the SDK facade as `gl`.
+import genlayer as gl
+from genlayer import *  # u256/i256 sizes, Address, Keccak256, SizedArray, ...
+
+# The v0.3.0 runner no longer star-exports the storage names, so import them
+# explicitly. `allow` is the storage-class decorator (i.e. gl.storage.allow); it
+# is bound to the name `allow_storage` so the dataclasses below read with the
+# canonical decorator spelling.
+from genlayer.storage import TreeMap, DynArray, allow as allow_storage
 
 # -----------------------------------------------------------------------------
 # Domain Constants & Taxonomy
@@ -73,7 +83,16 @@ ERROR_EXTERNAL  = "[EXTERNAL]"
 ERROR_TRANSIENT = "[TRANSIENT]"   # 429 / 5xx — retryable; validators agree if both hit it
 ERROR_LLM       = "[LLM]"
 
-DECISION_MALICIOUS = "MALICIOUS_REPORT"  # Tampered evidence: deposit slashed to protocol
+# Master-side integrity failure. The master fingerprint URI, its committed
+# document, or the surrounding metadata could not be resolved/verified. This is
+# never the producer's fault, so the deposit is REFUNDED, not slashed. Distinct
+# from DECISION_MALICIOUS below, which only fires on a valid master.
+DECISION_MASTER_UNVERIFIED = "MASTER_UNVERIFIED"
+
+# The master verified cleanly but the producer's derivative claim was fraudulent,
+# conflicting, or malformed (tampered/unresolvable derivative evidence). Only in
+# this case is the producer's deposit slashed to protocol reserves.
+DECISION_MALICIOUS = "MALICIOUS_REPORT"  # Tampered derivative: deposit slashed to protocol
 
 
 # -----------------------------------------------------------------------------
@@ -158,7 +177,7 @@ class _Recipient:
 # -----------------------------------------------------------------------------
 # Intelligent Contract Interface
 # -----------------------------------------------------------------------------
-class TuneLedgerRoyalty(gl.Contract):
+class TuneLedgerRoyalty(gl.contract.Contract):
     owner: Address
     musicology_oracle_base: str
     # Commitment to the AI model / enclave that evaluates clearances. Bound at
@@ -355,7 +374,10 @@ class TuneLedgerRoyalty(gl.Contract):
         )
 
         similarity = int(audit_res.get("similarity_score", 0))
-        fingerprint_verified = bool(audit_res.get("fingerprint_verified", False))
+        master_verified = bool(audit_res.get("master_verified", False))
+        derivative_verified = bool(audit_res.get("derivative_verified", False))
+        # Retained for the audit trail: true only when BOTH sides verified.
+        fingerprint_verified = master_verified and derivative_verified
         rationale = str(audit_res.get("rationale", "Musicology spectrogram evaluated."))
         registry_feed = str(audit_res.get("registry_feed_summary", "ISRC / AcoustID registry feed."))
         master_digest = str(audit_res.get("master_evidence_digest", ""))
@@ -365,29 +387,34 @@ class TuneLedgerRoyalty(gl.Contract):
             decision=str(audit_res.get("decision", DECISION_REJECTED)),
             similarity_score=similarity,
             sample_weight_pct=sample_weight,
-            fingerprint_verified=fingerprint_verified,
+            master_verified=master_verified,
+            derivative_verified=derivative_verified,
         )
 
+        dep = int(aggr.clearance_deposit_atto)
         if decision == DECISION_APPROVED:
             aggr.status = STATUS_APPROVED
             aggr.royalty_split_bps = u256(split_bps)
-            dep = int(aggr.clearance_deposit_atto)
             if dep > 0:
-                _Recipient(work.master_owner).emit_transfer(value=u256(dep), on="finalized")
+                _Recipient(work.master_owner).emit_transfer(u256(dep))
         elif decision == DECISION_MALICIOUS:
-            # Tampered fingerprint evidence — slash deposit to protocol reserves (owner).
+            # Master verified cleanly, but the producer's derivative claim is
+            # fraudulent, conflicting, or malformed — slash the deposit to the
+            # protocol reserves (owner). This is the ONLY path that penalizes
+            # the producer.
             aggr.status = STATUS_REJECTED
             aggr.royalty_split_bps = u256(0)
-            dep = int(aggr.clearance_deposit_atto)
             if dep > 0:
-                _Recipient(self.owner).emit_transfer(value=u256(dep), on="finalized")
+                _Recipient(self.owner).emit_transfer(u256(dep))
         else:
-            # Legitimate low-similarity rejection — refund deposit to producer.
+            # DECISION_MASTER_UNVERIFIED or DECISION_REJECTED. A master-side
+            # integrity failure (unresolvable master URI / commitment / metadata)
+            # or a legitimate low-similarity rejection. In neither case is the
+            # producer at fault, so the full deposit is refunded — never slashed.
             aggr.status = STATUS_REJECTED
             aggr.royalty_split_bps = u256(0)
-            dep = int(aggr.clearance_deposit_atto)
             if dep > 0:
-                _Recipient(aggr.derivative_producer).emit_transfer(value=u256(dep), on="finalized")
+                _Recipient(aggr.derivative_producer).emit_transfer(u256(dep))
 
         self.agreements[agreement_id] = aggr
 
@@ -418,25 +445,57 @@ class TuneLedgerRoyalty(gl.Contract):
         registry_url: str,
     ) -> dict:
         def leader_fn() -> dict:
-            # Acquire the acoustic evidence natively. Both documents are
-            # mandatory: without them there is nothing to compare, and guessing
-            # from titles alone is exactly the caller-controlled outcome this
-            # contract must avoid.
-            master_bytes = _fetch_evidence(master_uri, "master fingerprint")
-            derivative_bytes = _fetch_evidence(derivative_uri, "derivative fingerprint")
+            # --- MASTER SIDE ------------------------------------------------
+            # The master fingerprint is registered and owned by the master
+            # rights holder, not the producer. A master-side failure (dead URI,
+            # 4xx, empty document, or a commitment that no longer matches) is
+            # therefore never the producer's fault. It resolves to a clean
+            # DECISION_MASTER_UNVERIFIED and a full refund — the deposit is not
+            # slashed. Only a *transient* master fault (429/5xx) is re-raised so
+            # the transaction can be retried rather than settled.
+            try:
+                master_bytes = _fetch_evidence(master_uri, "master fingerprint")
+            except gl.vm.UserError as e:
+                if ERROR_TRANSIENT in str(e):
+                    raise
+                return _master_unverified_result(
+                    f"Master fingerprint evidence unresolvable: {str(e)}"
+                )
 
             master_digest = _keccak_hex(master_bytes)
+            if not _digest_matches(master_digest, expected_master_fingerprint):
+                # Master document no longer matches the commitment bound at work
+                # registration. A master-side integrity failure — refund, never slash.
+                return _master_unverified_result(
+                    "Master fingerprint does not match its on-chain commitment.",
+                    master_digest=master_digest,
+                )
+
+            # --- DERIVATIVE SIDE --------------------------------------------
+            # The master verified. The producer is accountable for the
+            # derivative evidence it pinned at agreement creation. A permanent
+            # derivative failure (dead URI / 4xx / empty) is a malformed claim,
+            # and a commitment mismatch is a tampered/conflicting claim — both
+            # slash. A transient derivative fault is re-raised for retry.
+            try:
+                derivative_bytes = _fetch_evidence(derivative_uri, "derivative fingerprint")
+            except gl.vm.UserError as e:
+                if ERROR_TRANSIENT in str(e):
+                    raise
+                return _malicious_derivative_result(
+                    f"Derivative fingerprint evidence unresolvable: {str(e)}",
+                    master_digest=master_digest,
+                )
+
             derivative_digest = _keccak_hex(derivative_bytes)
+            if not _digest_matches(derivative_digest, expected_derivative_fingerprint):
+                return _malicious_derivative_result(
+                    "Derivative fingerprint does not match its on-chain commitment.",
+                    master_digest=master_digest,
+                    derivative_digest=derivative_digest,
+                )
 
-            # Both evidence documents must match their on-chain commitments.
-            # The master commitment was bound at original work registration;
-            # the derivative commitment was bound at agreement creation. A
-            # mismatch on either means the evidence was replaced after the
-            # commitment was made, so the clearance cannot proceed.
-            master_verified = _digest_matches(master_digest, expected_master_fingerprint)
-            derivative_verified = _digest_matches(derivative_digest, expected_derivative_fingerprint)
-            fingerprint_verified = master_verified and derivative_verified
-
+            # --- BOTH SIDES VERIFIED — run the musicology quorum ------------
             registry_summary = _fetch_registry_summary(registry_url)
 
             # Sanitize user-supplied strings before embedding in prompt.
@@ -466,7 +525,9 @@ class TuneLedgerRoyalty(gl.Contract):
             )
 
             res = _run_musicology_llm(prompt)
-            res["fingerprint_verified"] = fingerprint_verified
+            res["master_verified"] = True
+            res["derivative_verified"] = True
+            res["fingerprint_verified"] = True
             res["master_evidence_digest"] = master_digest
             res["derivative_evidence_digest"] = derivative_digest
             res["registry_feed_summary"] = registry_summary[:256]
@@ -491,10 +552,12 @@ class TuneLedgerRoyalty(gl.Contract):
                 for field in ("master_evidence_digest", "derivative_evidence_digest"):
                     if str(leader.get(field, "")) != str(v_res.get(field, "")):
                         return False
-                if bool(leader.get("fingerprint_verified", False)) != bool(
-                    v_res.get("fingerprint_verified", False)
-                ):
-                    return False
+                # The master and derivative verification verdicts are compared
+                # independently, so two nodes cannot disagree on which side failed
+                # (which decides refund-vs-slash) and still reach consensus.
+                for field in ("master_verified", "derivative_verified"):
+                    if bool(leader.get(field, False)) != bool(v_res.get(field, False)):
+                        return False
 
                 # 2. A leader result is accepted if and only if it settles to the
                 #    exact same decision and the exact same royalty split as this
@@ -508,13 +571,15 @@ class TuneLedgerRoyalty(gl.Contract):
                     decision=str(leader.get("decision", DECISION_REJECTED)),
                     similarity_score=int(leader.get("similarity_score", 0)),
                     sample_weight_pct=sample_weight,
-                    fingerprint_verified=bool(leader.get("fingerprint_verified", False)),
+                    master_verified=bool(leader.get("master_verified", False)),
+                    derivative_verified=bool(leader.get("derivative_verified", False)),
                 )
                 validator_settlement = _compute_royalty_settlement(
                     decision=str(v_res.get("decision", DECISION_REJECTED)),
                     similarity_score=int(v_res.get("similarity_score", 0)),
                     sample_weight_pct=sample_weight,
-                    fingerprint_verified=bool(v_res.get("fingerprint_verified", False)),
+                    master_verified=bool(v_res.get("master_verified", False)),
+                    derivative_verified=bool(v_res.get("derivative_verified", False)),
                 )
 
                 #    Both components are compared exactly. There is deliberately
@@ -556,9 +621,9 @@ class TuneLedgerRoyalty(gl.Contract):
 
         # Autonomous Split
         if original_share > 0:
-            _Recipient(work.master_owner).emit_transfer(value=u256(original_share), on="finalized")
+            _Recipient(work.master_owner).emit_transfer(u256(original_share))
         if derivative_share > 0:
-            _Recipient(aggr.derivative_producer).emit_transfer(value=u256(derivative_share), on="finalized")
+            _Recipient(aggr.derivative_producer).emit_transfer(u256(derivative_share))
 
     # ------------------------------------------------------------------
     # 5. Cancellation, Dispute & Resolution
@@ -599,7 +664,51 @@ class TuneLedgerRoyalty(gl.Contract):
 
         dep = int(aggr.clearance_deposit_atto)
         if dep > 0:
-            _Recipient(aggr.derivative_producer).emit_transfer(value=u256(dep), on="finalized")
+            _Recipient(aggr.derivative_producer).emit_transfer(u256(dep))
+
+    @gl.public.write
+    def claim_expired_deposit(self, agreement_id: str) -> None:
+        """Producer self-service reclaim of an unevaluated, expired deposit.
+
+        A time-bounded escape hatch: once the expiry deadline has passed and the
+        agreement is still CLEARANCE_REQUESTED (never evaluated), the producer
+        can reclaim 100% of the locked deposit on their own — no counterparty
+        signature, no owner action, and no new agreement required. Before the
+        deadline the call is strictly rejected, so this cannot be used to pull a
+        deposit out from under an in-flight evaluation.
+        """
+        if agreement_id not in self.agreements:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Agreement {agreement_id} not found")
+
+        aggr = self.agreements[agreement_id]
+        if aggr.status != STATUS_REQUESTED:
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Only unevaluated (CLEARANCE_REQUESTED) deposits can be "
+                f"claimed; current status: {aggr.status}"
+            )
+
+        # Strictly reject any claim before the bounded deadline has elapsed.
+        if int(self.total_agreements_created) < int(aggr.expires_at_seq):
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Deposit is not yet claimable; expires at protocol "
+                f"count {int(aggr.expires_at_seq)}, current count is "
+                f"{int(self.total_agreements_created)}"
+            )
+
+        # Only the producer who funded the deposit may reclaim it — no
+        # counterparty action is required to unlock it.
+        if gl.message.sender_address != aggr.derivative_producer:
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Only the derivative producer can claim the expired deposit"
+            )
+
+        aggr.status = STATUS_CANCELLED
+        self.agreements[agreement_id] = aggr
+
+        # Refund 100% of the unevaluated deposit to the producer.
+        dep = int(aggr.clearance_deposit_atto)
+        if dep > 0:
+            _Recipient(aggr.derivative_producer).emit_transfer(u256(dep))
 
     @gl.public.write.payable
     def dispute_sample(self, agreement_id: str, dispute_reason: str) -> None:
@@ -664,14 +773,12 @@ class TuneLedgerRoyalty(gl.Contract):
             # Dispute is valid: agreement is rejected, bond returned to disputant.
             aggr.status = STATUS_REJECTED
             if bond > 0 and aggr.disputant_hex:
-                _Recipient(Address(aggr.disputant_hex)).emit_transfer(
-                    value=u256(bond), on="finalized"
-                )
+                _Recipient(Address(aggr.disputant_hex)).emit_transfer(u256(bond))
         elif resolution_upper == "DISMISSED":
             # Dispute is invalid: agreement reinstated, bond forfeited to master owner.
             aggr.status = STATUS_APPROVED
             if bond > 0:
-                _Recipient(work.master_owner).emit_transfer(value=u256(bond), on="finalized")
+                _Recipient(work.master_owner).emit_transfer(u256(bond))
         else:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} Resolution must be UPHELD or DISMISSED")
 
@@ -786,7 +893,8 @@ class TuneLedgerRoyalty(gl.Contract):
             decision=DECISION_APPROVED,
             similarity_score=int(similarity_score),
             sample_weight_pct=weight,
-            fingerprint_verified=True,
+            master_verified=True,
+            derivative_verified=True,
         )
         return {
             "decision": decision,
@@ -833,11 +941,56 @@ def _sample_weight_pct(sample_sec: int, total_sec: int) -> int:
     return (sample_sec * 100) // total_sec
 
 
+def _master_unverified_result(rationale: str, master_digest: str = "") -> dict:
+    """Leader result for a master-side integrity failure (refund, never slash).
+
+    master_verified is False, so _compute_royalty_settlement resolves this to
+    DECISION_MASTER_UNVERIFIED and the deposit is refunded to the producer. Both
+    the failure reason and the outcome are deterministic across nodes (a dead
+    host returns the same status, a mismatched commitment the same digest), so
+    validators reproduce this result exactly.
+    """
+    return {
+        "decision": DECISION_REJECTED,
+        "similarity_score": 0,
+        "rationale": rationale,
+        "master_verified": False,
+        "derivative_verified": False,
+        "fingerprint_verified": False,
+        "master_evidence_digest": master_digest,
+        "derivative_evidence_digest": "",
+        "registry_feed_summary": "",
+    }
+
+
+def _malicious_derivative_result(
+    rationale: str, master_digest: str, derivative_digest: str = ""
+) -> dict:
+    """Leader result for a valid master with a bad derivative claim (slash).
+
+    master_verified is True and derivative_verified is False, so the settlement
+    resolves to DECISION_MALICIOUS and the producer's deposit is slashed to the
+    protocol reserves. This is the only path that penalizes the producer.
+    """
+    return {
+        "decision": DECISION_REJECTED,
+        "similarity_score": 0,
+        "rationale": rationale,
+        "master_verified": True,
+        "derivative_verified": False,
+        "fingerprint_verified": False,
+        "master_evidence_digest": master_digest,
+        "derivative_evidence_digest": derivative_digest,
+        "registry_feed_summary": "",
+    }
+
+
 def _compute_royalty_settlement(
     decision: str,
     similarity_score: int,
     sample_weight_pct: int,
-    fingerprint_verified: bool,
+    master_verified: bool,
+    derivative_verified: bool,
 ) -> tuple[str, int]:
     """Map an audit reading to a discrete settlement (decision, split bps).
 
@@ -846,11 +999,24 @@ def _compute_royalty_settlement(
     dependence on the raw similarity score beyond which band it falls into. Two
     nodes reading, say, 86 and 97 land in the same band and therefore compute
     the same decision and the same royalty split.
+
+    The master and derivative sides are evaluated on separate paths so a
+    master-side failure never punishes the producer:
+
+      * master not verified  -> DECISION_MASTER_UNVERIFIED (deposit refunded)
+      * master ok, derivative not verified -> DECISION_MALICIOUS (deposit slashed)
+      * both verified, low similarity      -> DECISION_REJECTED (deposit refunded)
+      * both verified, sufficient          -> DECISION_APPROVED (deposit -> master)
     """
-    # Evidence that did not verify against the on-chain commitment is treated as
-    # a MALICIOUS_REPORT (tampered/swapped document) — deposit is slashed, not
-    # refunded. This is distinct from a legitimate low-similarity REJECTED.
-    if not fingerprint_verified:
+    # A master-side integrity failure (unresolvable master URI, missing/empty
+    # document, or a commitment that no longer matches) is never the producer's
+    # fault, so it settles to MASTER_UNVERIFIED and the deposit is refunded —
+    # checked FIRST so a broken master can never reach the slashing path below.
+    if not master_verified:
+        return (DECISION_MASTER_UNVERIFIED, 0)
+    # The master verified but the producer's derivative evidence did not (a
+    # fraudulent, conflicting, or malformed claim). This is the only slashing path.
+    if not derivative_verified:
         return (DECISION_MALICIOUS, 0)
     if decision != DECISION_APPROVED:
         return (DECISION_REJECTED, 0)

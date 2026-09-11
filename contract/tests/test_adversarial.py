@@ -23,6 +23,7 @@ from conftest import (
 # ---------------------------------------------------------------------------
 
 _TAMPERED_MASTER_DOC = '{"format": "chromaprint", "vector": [0, 0, 0], "tampered": true}'
+_TAMPERED_DERIVATIVE_DOC = '{"format": "chromaprint", "vector": [7, 7, 7], "tampered": true}'
 
 
 # ---------------------------------------------------------------------------
@@ -65,14 +66,19 @@ def test_injection_in_title_cannot_override_llm_verdict(direct_vm, direct_deploy
 # ---------------------------------------------------------------------------
 # Test 2 — Griefing / MALICIOUS_REPORT Slashing
 # ---------------------------------------------------------------------------
-def test_tampered_master_fingerprint_resolves_malicious_report(direct_vm, direct_deploy, direct_alice, direct_bob):
-    """A master fingerprint document that does not match its on-chain commitment
-    must resolve to MALICIOUS_REPORT in the audit record and REJECTED agreement
-    status, even when the LLM returns a confident APPROVED at the top tier.
+def test_tampered_master_fingerprint_refunds_without_slashing(direct_vm, direct_deploy, direct_alice, direct_bob):
+    """A tampered MASTER fingerprint must NOT slash the producer's deposit.
 
-    The keccak commitment was bound to MASTER_DOC at work registration time;
-    the mock serves _TAMPERED_MASTER_DOC — a different payload.  The resulting
-    digest mismatch sets fingerprint_verified=False and forces DECISION_MALICIOUS.
+    Fund-safety invariant (separate master/derivative verification): the master
+    fingerprint is registered and owned by the master rights holder, not the
+    producer. If it no longer matches its on-chain commitment, that is a
+    master-side integrity failure — the clearance aborts cleanly and the deposit
+    is REFUNDED to the producer, recorded as MASTER_UNVERIFIED. It must never
+    resolve to MALICIOUS_REPORT (which slashes), even when the LLM returns a
+    confident APPROVED at the top tier.
+
+    The keccak commitment was bound to MASTER_DOC at work registration time; the
+    mock serves _TAMPERED_MASTER_DOC — a different payload.
     """
     contract = direct_deploy(CONTRACT_PATH)
     register_work(contract, direct_vm, direct_alice, work_id="work-malicious")
@@ -82,7 +88,7 @@ def test_tampered_master_fingerprint_resolves_malicious_report(direct_vm, direct
         deposit_atto=5 * ATTO,
     )
 
-    # Serve a tampered document — hash will not match the on-chain commitment.
+    # Serve a tampered MASTER document — hash will not match the on-chain commitment.
     mock_fingerprint_evidence(direct_vm, master_doc=_TAMPERED_MASTER_DOC)
     mock_music_registry_oracle(direct_vm)
     mock_ai_musicology(direct_vm, decision="APPROVED", similarity_score=99)
@@ -95,8 +101,47 @@ def test_tampered_master_fingerprint_resolves_malicious_report(direct_vm, direct
 
     record = contract.get_records("aggr-malicious")[0]
     assert record["fingerprint_verified"] is False
+    # The decision field determines the fund route: MASTER_UNVERIFIED refunds the
+    # producer, MALICIOUS_REPORT slashes. A master-side failure must refund.
+    assert record["decision"] == "MASTER_UNVERIFIED", (
+        "Tampered MASTER fingerprint must refund the producer (MASTER_UNVERIFIED), not slash"
+    )
+    assert record["decision"] != "MALICIOUS_REPORT", (
+        "A master-side failure must never slash the producer's deposit"
+    )
+
+
+def test_tampered_derivative_fingerprint_resolves_malicious_report(direct_vm, direct_deploy, direct_alice, direct_bob):
+    """A tampered DERIVATIVE fingerprint (with a valid master) must slash.
+
+    This is the complement of the master case: the master verifies cleanly, so
+    the producer is accountable for the derivative evidence it pinned. A digest
+    mismatch there is a fraudulent/conflicting claim and resolves to
+    MALICIOUS_REPORT (deposit slashed to protocol reserves).
+    """
+    contract = direct_deploy(CONTRACT_PATH)
+    register_work(contract, direct_vm, direct_alice, work_id="work-deriv-mal")
+    create_agreement(
+        contract, direct_vm, direct_bob,
+        agreement_id="aggr-deriv-mal", work_id="work-deriv-mal",
+        deposit_atto=5 * ATTO,
+    )
+
+    # Master matches its commitment; derivative is tampered.
+    mock_fingerprint_evidence(direct_vm, derivative_doc=_TAMPERED_DERIVATIVE_DOC)
+    mock_music_registry_oracle(direct_vm)
+    mock_ai_musicology(direct_vm, decision="APPROVED", similarity_score=99)
+
+    contract.evaluate_sample_clearance("aggr-deriv-mal")
+
+    aggr = contract.get_agreement("aggr-deriv-mal")
+    assert aggr["status"] == "REJECTED"
+    assert aggr["royalty_split_bps"] == 0
+
+    record = contract.get_records("aggr-deriv-mal")[0]
+    assert record["fingerprint_verified"] is False
     assert record["decision"] == "MALICIOUS_REPORT", (
-        "Tampered fingerprint evidence must produce a MALICIOUS_REPORT audit record"
+        "A tampered derivative claim over a valid master must slash (MALICIOUS_REPORT)"
     )
 
 

@@ -10,8 +10,8 @@
 
 > **Deterministic Sample Clearance, Chromaprint Spectrogram Quorum & Real-Time DSP Streaming Revenue Distribution on GenLayer.**
 
-[![Network](https://img.shields.io/badge/GenLayer-StudioNet-FF4500.svg?style=for-the-badge&logo=soundcharts)](https://studio.genlayer.com)
-[![Direct Tests](https://img.shields.io/badge/Direct_Tests-67%2F67_Passing-00E5FF.svg?style=for-the-badge)](contract/tests/)
+[![Network](https://img.shields.io/badge/GenLayer-Studio--Dev-FF4500.svg?style=for-the-badge&logo=soundcharts)](https://studio-dev.genlayer.com)
+[![Direct Tests](https://img.shields.io/badge/Direct_Tests-101%2F101_Passing-00E5FF.svg?style=for-the-badge)](contract/tests/)
 [![Acoustic Engine](https://img.shields.io/badge/Acoustic_Engine-Chromaprint_Keccak256-FFD700.svg?style=for-the-badge)](contract/contracts/tuneledger_royalty.py)
 [![License](https://img.shields.io/badge/License-MIT-purple.svg?style=for-the-badge)](LICENSE)
 
@@ -62,15 +62,16 @@ and 85 disagree (2800 vs 4000 bps) and are rejected.
 
 ---
 
-## StudioNet Deployment Metadata
+## Studio-Dev Deployment Metadata
 
 ```yaml
 Protocol Name: TuneLedger Music Royalty Engine
-Chain Architecture: GenLayer StudioNet (Chain ID: 61999)
-Contract Address: "0x9452A910C3bB23f18A4d655de7133E98eD0fDbc2"
-Deployer Account: "0x5A9cA319a6566CD5a4476f1e9b77fB3fE4daC66D"
-Deployment Tx: "0x2b689de0fb07b46c442999916b3a6e6564c9ae2936fc5e43162e622d8d277ff5"
-Explorer: "https://explorer-studio.genlayer.com/address/0x9452A910C3bB23f18A4d655de7133E98eD0fDbc2"
+Chain Architecture: GenLayer Studio Devnet (Chain ID: 61997)
+Runner: py-genlayer v0.3.0 (5jycge4q8k23462jtb0b9fyey1s9qz928sz2nbrd9mg4sxqg2qng)
+Contract Address: "0x211488f2d01bA2B48B81377290691B8687C5b899"
+Deployer Account: "0x2e56c8579fa11cb144e6fd778da772061f4dd930"
+Deployment Tx: "0xbdfb4b22794481ff22ce2bef7425eb9ecb762d7127105ffef9ab2b94b54fc94d"
+Explorer: "https://explorer-studio-dev.genlayer.com/address/0x211488f2d01bA2B48B81377290691B8687C5b899"
 Status: ACTIVE_DEPLOYED
 ```
 
@@ -208,7 +209,7 @@ deposit_streaming_royalties(agreement_id="agree-jungle-remix-2026")
 ======================================================================
 ```
 
-### Full Pytest Direct-Mode Suite (67/67 Passed):
+### Full Pytest Direct-Mode Suite (101/101 Passed):
 ```bash
 make test
 ```
